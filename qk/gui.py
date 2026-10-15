@@ -402,13 +402,16 @@ class MainWindow:
                 self.last_error = ""
                 self.font_family = font_family
                 self.font_dir = font_dir
+                #: 用户手动查询/开始抢课会置位它，让挂起的「登录后自动查询」作废，
+                #: 避免自动任务和用户操作抢忙碌态。
+                self._auto_query_cancelled = False
                 self._build_ui()
                 self._wire()
                 self._queried_once = False
                 #: 是否处于「可以安全发起下一次查询」的状态（worker 结束时置位）
                 self._query_idle = True
                 self._load_exclude_from_config()
-                self.append_log("界面已就绪。先「扫码登录」保存会话，再查询课程、加入目标。")
+                self.append_log("界面已就绪。登录后会自动查询课程（也可以手动点「查询」）。")
                 self.append_log(f"字体：{font_family or '（未找到中文字体候选，可能显示为方块）'}"
                                 f"；字体目录：{font_dir or '（未指定）'}")
                 if mock_server is not None:
@@ -801,9 +804,38 @@ class MainWindow:
                     self.set_session_label(
                         f"会话状态：已登录（学号 {result.get('student_id', '')}；"
                         f"{result.get('view', {}).get('expires_at', '')} 过期）")
+                    # 登录成功后**自动查询**（用户要求：第二步不必再手动点「查询」）。
+                    # 用 singleShot(0) 推迟一拍：此刻登录线程还没完全退出，
+                    # 直接调 on_query() 会被 is_busy() 挡掉、静默什么都不做。
+                    QtCore.QTimer.singleShot(0, lambda: self._auto_query("登录成功"))
                 else:
                     message = (result or {}).get("message", "登录未成功") if isinstance(result, dict) else "登录未成功"
                     self.set_session_label(f"会话状态：登录失败（{message}）")
+
+            def _auto_query(self, reason: str, *, _retry: int = 0) -> None:
+                """登录成功后自动查询课程列表。
+
+                抢课要看的候选就在②里；让它自动出现，省掉一次点击。
+                **只在扫码登录成功后触发** —— 打开界面时不自动打请求，
+                免得用户只是想开个窗口就产生网络流量。
+
+                **必须可被显式操作取消**：自动查询若卡在忙碌态上重试，会吞掉用户
+                紧接着点的「查询」或「开始」。所以：
+
+                * 用户手动查询/抢课时把 ``_auto_query_cancelled`` 置位，挂起的自动查询作废；
+                * 重试次数有限（最多 3 次 ≈ 600ms），不做无限等待。
+                """
+                if self._auto_query_cancelled:
+                    return
+                if self.is_busy():
+                    if _retry < 3:
+                        QtCore.QTimer.singleShot(
+                            200, lambda: self._auto_query(reason, _retry=_retry + 1))
+                    else:
+                        self.append_log("自动查询已让位给其它任务；需要时请点「查询」")
+                    return
+                self.append_log(f"{reason}，自动查询课程…（无需手动点「查询」）")
+                self.on_query(auto=True)
 
             def on_session_info(self) -> None:
                 info = self.backend.session_view()
@@ -824,7 +856,14 @@ class MainWindow:
                 self.append_log(message)
 
             # -------------------------------------------------- 查询动作
-            def on_query(self) -> None:
+            def on_query(self, *, auto: bool = False) -> None:
+                """查询课程。
+
+                ``auto=True`` 表示由「登录成功后自动查询」触发；用户手动点击时
+                顺手取消挂起的自动查询，免得它稍后再抢一次忙碌态。
+                """
+                if not auto:
+                    self._auto_query_cancelled = True
                 if self.is_busy():
                     return
                 keyword = self.edit_keyword.text().strip()
@@ -921,6 +960,8 @@ class MainWindow:
                 return any(worker.isRunning() for worker in self.workers)
 
             def on_start(self) -> None:
+                # 用户要开始抢课了：取消可能还挂着的自动查询，别让它争忙碌态
+                self._auto_query_cancelled = True
                 if self.is_busy():
                     self.append_log("已有任务在运行，请先等待或点「停止」")
                     return

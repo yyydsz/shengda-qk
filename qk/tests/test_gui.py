@@ -937,3 +937,73 @@ def test_dry_run_plan_explains_online_only_flow(gui_app: Any, json_env: Any, win
     assert "面授" in log
     assert "最多抢 2 门" in log
     assert "没有发起任何网络请求" in log
+
+
+# ==========================================================================
+# 登录成功后**自动查询**课程
+#
+# 需求：第二步「课程查询」不必手动点 —— 扫码登录成功就该把候选列表拉出来。
+#
+# 两条约束（都是踩出来的）：
+#   * 打开界面时**不**自动打请求（只想开个窗口不该产生网络流量）；
+#   * 自动查询必须能被用户的下一步操作取消，否则它会占住忙碌态、
+#     把紧接着点下的「查询」或「开始」吞掉（测试 test_network_paths_run_off_main_thread
+#     就是这样被抓出来的）。
+# ==========================================================================
+
+
+def test_login_auto_queries_courses(gui_app: Any, kingosoft_env: Any, window: Any) -> None:
+    """扫码登录成功后，课程表应当**自动**被填满（用户没点「查询」）。"""
+    _server, config = kingosoft_env
+    win = window(config)
+    assert win.table_courses.rowCount() == 0, "初始不该有课程"
+
+    win.on_qr_login()
+    assert pump(gui_app, lambda: win.table_courses.rowCount() > 0, timeout=20), (
+        "登录成功后应当自动查询出课程，实际课程表仍为空"
+    )
+    log = win.log_view.toPlainText()
+    assert "自动查询课程" in log, log
+    assert "无需手动点「查询」" in log, log
+    # 等后台线程收尾再关窗，否则 Qt 会报 QThread: Destroyed while thread is still running
+    assert pump(gui_app, lambda: not win.is_busy(), timeout=15), "自动查询未结束"
+
+
+def test_auto_query_stops_after_login_failure(gui_app: Any, json_env: Any, window: Any) -> None:
+    """登录失败时不该触发查询（没有会话，查了也是报错）。"""
+    _server, config = json_env
+    win = window(config)
+    win._after_login({"ok": False, "message": "测试：登录未成功"})
+    gui_app.processEvents()
+    assert win.table_courses.rowCount() == 0
+    # 用自动查询那条日志的完整措辞判断，避免被启动横幅里的同名字样误命中
+    # （横幅写的是「登录后会自动查询课程」，含有「自动查询课程」子串）
+    assert "，自动查询课程…（无需手动点" not in win.log_view.toPlainText()
+
+
+def test_manual_query_cancels_pending_auto_query(gui_app: Any, json_env: Any, window: Any) -> None:
+    """用户手动点「查询」后，挂起的自动查询要作废，不再抢忙碌态。"""
+    _server, config = json_env
+    win = window(config)
+    assert win._auto_query_cancelled is False
+
+    win.on_query()                      # 手动查询
+    assert win._auto_query_cancelled is True, "手动查询应当取消挂起的自动查询"
+    assert pump(gui_app, lambda: not win.is_busy(), timeout=15), "手动查询未结束"
+
+    # 即便此时再调自动查询，也不该发起（已被取消）
+    win._auto_query_cancelled = True
+    before = win._queried_once
+    win._auto_query("登录成功")
+    gui_app.processEvents()
+    assert win._queried_once == before
+
+
+def test_start_cancels_pending_auto_query(gui_app: Any, json_env: Any, window: Any) -> None:
+    """点「开始」抢课时也要取消挂起的自动查询。"""
+    _server, config = json_env
+    win = window(config)
+    win._auto_query_cancelled = False
+    win.on_start()                      # 演练模式，只打印计划
+    gui_app.processEvents()
+    assert win._auto_query_cancelled is True
