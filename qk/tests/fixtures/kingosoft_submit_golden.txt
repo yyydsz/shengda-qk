@@ -1,0 +1,5 @@
+# 金标准：2026-10-14 21:38 浏览器在「通识选修课(退补选)」里**成功选上** 01265731 时
+# 实际提交的明文参数（用服务端下发的临时密钥解密 saveElectiveCourse 的 params 得到）。
+# 该次提交后页面「已选」由 12门/24.5学分 变为 13门/25.5学分 —— 确认成功。
+# 用途：test_kingosoft_write_params_matches_golden 逐字段比对，防止参数格式再退化。
+xktype=2&lcid=35732179068578980275991&xxkckzfs=0&yxkzyfxxk=0&yxsjct=0&xn=2026&xq=0&xh=20230001&nj=2024&zydm=0501&kcdm=01265731&kclb1=03&kclb2=01&kclb3=13&khfs=02&xfsx=undefined&mssx=undefined&skbjdm=01265731-002&skbzdm=&xf=1.0&is_checkTime=1&zfx_m=0&outnumber=0&xsszxq=1&xqdm=&kcmc=&kcfw=zxggrx&njzy=2024%7C0501&txt_skbjdm=&xk_points=0&is_buy_book=0&is_cx=0&is_yxtj=1&menucode_current=

@@ -1,0 +1,6 @@
+# qk 图形界面的**可选**依赖（命令行功能不需要它）
+#
+#   python -m pip install -r requirements-gui.txt
+#
+# 装好后即可用 `python -m qk gui` 打开可视化界面。
+PyQt6>=6.6

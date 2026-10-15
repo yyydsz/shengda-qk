@@ -1,0 +1,80 @@
+# ============================================================================
+# qk —— 开源仓库 .gitignore
+#
+# 原则：**默认不信任工作目录**。这个仓库的上一级目录曾被用于实际抢课，
+# 里面混着浏览器存档、可用性探测产物、以及本地会话文件。
+# 凡是「跑出来的」东西一律忽略，只让源码、测试、文档、示例配置入库。
+# 提交前请再跑一次：python tools/check_no_secrets.py
+# ============================================================================
+
+# ---------------------------------------------------------------- Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# ---------------------------------------------------------------- 本地凭据（绝不入库）
+# config.yaml 里含学号/密码；qk_state.json 里含 CASTGC 会话票据。
+# 一旦泄露，别人可以顶替你的身份登录教务系统。
+config.yaml
+config.yml
+config.local.yaml
+config.*.yaml
+!config.example.yaml
+config.yaml.bak
+*.bak
+.env
+.env.*
+*.secrets.yaml
+qk_state.json
+qk_state.json.*
+qk_state*.json
+
+# ---------------------------------------------------------------- 运行产物
+logs/
+*.log
+runs/
+*.har
+*.session
+tmp_*
+*.tmp
+
+# ---------------------------------------------------------------- 侦查阶段残留（不属于本项目）
+# 这些是排查「选课系统为什么进不去」时抓下来的存档：门户/搜索页面快照、
+# RSA 与前端 bundle 分析、可用性探测输出。另一所学校的 bundle（scau_*）也在其中。
+gh_search.html
+my_login.html
+news_portal.htm
+search_bing.html
+search_lyuap.html
+twin_1.html
+scau_*.js
+scau_*.css
+rsa_mod29.js
+rsa_port.py
+test_rsa_node.js
+cas_login_headers.txt
+node_out.txt
+py_out.txt
+probe/
+
+# ---------------------------------------------------------------- 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini

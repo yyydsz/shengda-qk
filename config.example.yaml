@@ -1,0 +1,192 @@
+# qk 配置示例。复制为 config.yaml 后按需修改；config.yaml 已在 .gitignore 中，不会入库。
+# 所有字段都可以用环境变量覆盖，前缀 QK_，嵌套层级用双下划线，例如：
+#   QK_STUDENT_ID=20230001
+#   QK_PASSWORD=你的密码
+#   QK_HTTP__INTERVAL=0.5
+
+credentials:
+  # 学号（也可以用环境变量 QK_STUDENT_ID）
+  student_id: ""
+  # 密码建议只放在环境变量里，避免明文落盘：QK_PASSWORD
+  password: ""
+  # 若登录页需要验证码、且你选择手工输入，可在这里或 QK_CAPTCHA_CODE 填一次
+  captcha_code: ""
+
+http:
+  # 单个请求超时（秒）
+  timeout: 10.0
+  # 相邻两个请求的最小间隔（秒）。请勿调到 0，避免给教务服务器造成压力
+  interval: 0.35
+  # 失败重试次数（网络错误、HTTP 429/5xx 会按指数退避重试）
+  max_retries: 3
+  # 退避基数（秒）：第 n 次重试等待 backoff * 2^(n-1) 秒，再叠加随机抖动
+  backoff: 0.6
+  # 同时进行的请求数上限
+  concurrency: 2
+  # 证书校验：只有在内网自签证书导致无法访问时才改成 false
+  verify_tls: true
+
+cas:
+  # 统一身份认证（CAS）登录入口。已实测确认：升达用的是联奕 lyuapServer 平台，
+  # 登录页 https://cas.shengda.edu.cn/lyuapServer/login 可正常访问。
+  login_url: "https://cas.shengda.edu.cn/lyuapServer/login"
+  # 登录成功后要跳回的地址
+  service: "https://my.shengda.edu.cn/"
+  logout_url: "https://cas.shengda.edu.cn/lyuapServer/logout?service=https://my.shengda.edu.cn/"
+  username_field: "username"
+  password_field: "password"
+  # 额外表单字段（例如 lt / execution / _eventId 等，按实际情况填）
+  extra_fields: {}
+  # 登录成功后的页面里应出现的关键词，用于判断是否真的登录成功（留空则不校验）
+  success_keywords: []
+  # 验证码字段名与提示语（登录页有验证码时填写）
+  captcha_field: "captcha"
+  captcha_hint: ""
+  # 登录方式：password=账号密码（默认）；wechat=微信扫码（等价于 login --wechat）
+  login_mode: "password"
+  # 扫码拿到凭据后如何建立会话：auto=先试 REST 再回退 HTML 表单；rest；form
+  establish_strategy: "auto"
+
+  # ---------------------------------------------------------------- 微信扫码
+  # 以下端点均为 2026-10 对升达真实系统的实测结果：
+  #   GET  /lyuapServer/loginType            → data.isWeChat == "1"（已启用扫码）
+  #   GET  /lyuapServer/weChat/CreateQRcode  → 平铺 {uuid, content}，content 是 PNG data URI
+  #   POST /lyuapServer/weChat/wx/CheckScan  → JSON {"state": uuid}；等待态 statusCode=500
+  # 成功态字段名（userName/passWord/service）与 REST 两步建会话来自同族平台前端代码，
+  # 升达实例上尚未实测到，因此全部可配置；真实联调后如有差异改这里即可。
+  wechat:
+    login_type_path: "/lyuapServer/loginType"
+    qrcode_path: "/lyuapServer/weChat/CreateQRcode"
+    check_scan_path: "/lyuapServer/weChat/wx/CheckScan"
+    rest_tickets_path: "/lyuapServer/v1/tickets"
+    # 轮询间隔与等待扫码的总时长（秒）
+    poll_interval: 1.5
+    poll_timeout: 180.0
+    # 二维码过期时自动重取几次
+    max_qr_refresh: 1
+    # 响应字段名
+    uuid_field: "uuid"
+    content_field: "content"
+    user_field: "userName"
+    password_field: "passWord"
+    service_field: "service"
+    success_field: "success"
+    waiting_status_code: 500
+    # 终端二维码绘制：0=按终端编码能力自动选（utf-8 用半块、cp936 用实心块、纯 ASCII 终端用 ##）
+    qr_width: 0
+    qr_quiet_zone: 2
+    qr_color: true
+    qr_invert: false
+
+# 登录会话缓存：扫码一次后可复用，供定时抢课（grab --use-session）使用。
+# 文件已在 .gitignore 中排除；内容含 Cookie 名值对（复用所必需），日志与终端只显示名字。
+session:
+  path: "qk_state.json"
+  max_age_hours: 8.0
+
+jwgl:
+  # 平台选择：kingosoft=本校教务（青果 Kingosoft，已适配）；auto/custom/qz=通用实现
+  # （按下面四个 *_path 手工配置；留空即明确报错，不会乱发请求）。
+  platform: "kingosoft"
+
+  # --- Kingosoft（本校）用到的字段，默认值均为实测真值，一般无需修改 ---
+  # 教务系统基址（**不是**门户主机；http 同端口会 302 到 https）
+  kingosoft_base_url: "https://jw.shengda.edu.cn:8090/"
+  # 教务的 CAS service：必须与浏览器一致（实测为 http）
+  cas_service: "http://jw.shengda.edu.cn:8090/caslogin"
+  # 菜单上下文（缺它，选课页会返回「错误:无效访问请求」）
+  menu_context_path: "/frame/normalusemenu/getBreadcrumbsInfoNew.action"
+  menucode: "S2020202"          # S2020202 = 选课(按开课计划)
+  data_table_path: "/taglib/DataTable.jsp"
+  course_list_table_id: "2568"  # 课程列表报表 id（快速选课是 5929101）
+  time_range_path: "/jw/common/getWsxkTimeRange.action"
+  xktype: "2"
+  # 写操作加密所需的临时密钥 / 服务端时间戳
+  temp_key_path: "/frame/homepage?method=getTempDeskey"
+  temp_time_path: "/frame/homepage?method=getTempNowtime"
+
+  # --- 通用实现（platform=auto/custom/qz）用到的字段 ---
+  # 教务（选课）系统基址（门户）
+  base_url: "https://my.shengda.edu.cn/"
+  # 这四个路径**默认留空**：kingosoft 平台用不到它们（路径已内置）；
+  # 其他平台留空时会报「教务接口尚未确认」并指出该填哪一项，不会猜路径乱发请求。
+  #
+  # 以下为 2026-10-13 在真实校园网确认的 Kingosoft 契约（已内置，仅供核对）：
+  #   前置：POST /frame/normalusemenu/getBreadcrumbsInfoNew.action?menucode=S2020202
+  #   选课页：GET  /student/wsxk.zx.html                     （实测 HTTP 200 / 31481 字节）
+  #   查询候选课程：POST /taglib/DataTable.jsp?tableId=2568&fre=1
+  #         （实测 200 / text/html;charset=GBK，列为 课程/学分/总学时/课程类别/课程属性/
+  #          上课班号/上课班级名称/选课方式/任课教师/选课状态/操作，隐藏列 kcdm/skbzdm/skbjdm。
+  #          **真实表没有容量/余量列**，适配器不会凭空造这两个值）
+  #   选课上下文：GET /jw/common/getWsxkTimeRange.action?xktype=2
+  #         （返回 xn/xqM/kcfw/lcid/nj/zydm/yxbdm/qssj/jssj/lcmc 等，查询参数取自这里）
+  #   提交选课：POST /jw/common/saveElectiveCourse.action   （**写操作**；参数经
+  #         /frame/homepage?method=getTempDeskey 取密钥后 DES 加密 + base64，并带 md5 token；
+  #         适配器已实现并有离线用例覆盖，**真机提交未实测**，需用户对具体课程明确同意后才可发送）
+  #   退课：POST /jw/common/cancelElectiveCourse.action     （**写操作**；同样走加密参数）
+  #   已选/学分：GET /jw/common/getSelectLessonScoreKcsInfo.action
+  #              GET /student/report/wsxk.zx_promt_yxkctj.jsp（实测 200「主修学分修读情况」，
+  #              **尚不足以证明它就是「已选列表」端点**，故 selected_list_path 仍留空）
+  #
+  # 已探测但**不适用**、禁止填入：/jsxsd/**（另一套产品线：无会话 515「凭证已失效」，
+  # 有会话 1098「无效访问请求」）、/jwglxt/**、/xk/**、/jw/**（均为 404/连接被重置）。
+  #
+  # 使用前提：先 `python -m qk login --wechat --save-session` 拿到 CASTGC 会话（8 小时有效），
+  # 再用 `python -m qk list --use-session` 查课程（青果教务必须带 --use-session）、
+  # `python -m qk run --dry-run` 演练，最后 `python -m qk grab --use-session` 正式抢。
+  # 完整步骤与实测结论见 README「抢课操作（升达 · 青果 Kingosoft）」。
+  #
+  # 会话过期时教务适配器会抛「请先执行 login --wechat --save-session」的可操作提示；
+  # 若响应体里出现 `TGT :TGT-…已失效`，说明 CAS 侧票据已失效（本地 Cookie 仍在），同样重新扫码即可。
+  # 缺少学号等配置问题仍按既有约定以退出码 2 结束。
+  #
+  # 实测状态（2026-10-13，用户扫码后的真实会话）：查询课程（读）已实测可用并跑到「匹配目标」；
+  # 提交选课/退课（写）按平台前端契约实现、有离线用例覆盖，但**真实环境未触发过**——当时的
+  # 具体原因是：① 该轮次「按开课计划」五个范围与「重修选课」两个 tableId 全部 0 数据行，没有可匹配目标；
+  # ② 真正提交会改变选课结果，需先取得对具体课程的明确同意（本轮未获得）。详见 README「本轮实测到哪里」。
+  index_path: "/"
+  course_list_path: ""
+  select_path: ""
+  drop_path: ""
+  selected_list_path: ""
+  # 平台标识已在上方统一设置（kingosoft=本校教务；auto/custom/qz=通用实现）。
+  # 选课请求的额外固定参数（学期、志愿类型等），键值会原样带上
+  extra_params: {}
+
+  # 按「授课形式」把课程从列表里滤掉（子串匹配，大小写不敏感；**客户端过滤**）。
+  # 用途：本校通识选修课列表里 117 门全部是「通识面授课」，想只看网络课/慕课时就靠它。
+  # 属性值取自真实响应的 course_attr，形如「经济管理类/通识面授课」——
+  # 所以写「通识面授课」即可把面授课全部排除。
+  #
+  # 留空（默认）= 不过滤，保持既有行为。需要时改成：
+  #   exclude_course_attrs:
+  #     - "通识面授课"
+  #
+  # 注意：服务器仍会返回全部课程，本项只裁剪展示与抢课目标匹配用的列表，
+  # 不改变发往服务器的请求参数；也不会因为过滤而让课程更容易选上。
+  exclude_course_attrs: []
+
+grab:
+  # 起抢时间；留空表示立即开始。支持 "2026-10-13 12:00:00" 或 "12:00:00"（今天）
+  start_at: ""
+  # 每次尝试之间的间隔（秒）
+  retry_interval: 1.5
+  # 单个目标最多尝试多少次
+  max_attempts: 60
+  # 抢到一门就停止
+  stop_on_success: true
+  # 若目标课程已在已选列表里，是否先退掉再选（默认不动，直接跳过）
+  drop_if_selected: false
+  # 抢课目标，按 priority 从小到大尝试。
+  # 每个目标至少给 course_name / course_code / teaching_class_id 之一，否则会被配置校验拒绝。
+  targets:
+    # 示例一：只按课程名 + 教师抢（最常用）
+    - course_name: "大学体育Ⅲ"
+      teacher: ""
+      priority: 0
+    # 示例二：按课程号或教学班号精确锁定；不用的字段留空即可，但整条不能没有任何标识
+    - course_name: ""
+      course_code: "示例课程号（如 12345678）"
+      teaching_class_id: ""
+      time_text: ""
+      priority: 1
