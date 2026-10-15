@@ -42,6 +42,12 @@ cas:
   # 验证码字段名与提示语（登录页有验证码时填写）
   captcha_field: "captcha"
   captcha_hint: ""
+  # 图片验证码端点（账号密码登录用）。2026-10-15 实测：
+  #   GET {cas}/lyuapServer/kaptcha?_t=<毫秒时间戳>&uid=
+  #   → {"kaptchaType":"1","uid":"<32位hex>","content":"data:image/png;base64,…"}
+  # 图里是一道算术题（如 "6 * 4 ="），把结果填进验证码框即可。
+  # 返回的 uid 必须随登录回传（字段名 id），否则服务端判定验证码无效。
+  captcha_path: "/lyuapServer/kaptcha"
   # 登录方式：password=账号密码（默认）；wechat=微信扫码（等价于 login --wechat）
   login_mode: "password"
   # 扫码拿到凭据后如何建立会话：auto=先试 REST 再回退 HTML 表单；rest；form

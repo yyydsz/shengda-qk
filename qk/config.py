@@ -75,6 +75,11 @@ class CasConfig:
     #: 需要验证码时的提示与本地识别开关
     captcha_field: str = "captcha"
     captcha_hint: str = ""
+    #: 图片验证码端点（账号密码登录用）。2026-10-15 抓包确认：
+    #: ``GET {cas}/lyuapServer/kaptcha?_t=<毫秒时间戳>&uid=``
+    #: → ``{"kaptchaType":"1","uid":"…","content":"data:image/png;base64,…"}``。
+    #: 返回的 ``uid`` 必须随登录一起提交（字段名 ``id``），否则服务端判定验证码无效。
+    captcha_path: str = "/lyuapServer/kaptcha"
     #: 登录方式：password=账号密码（默认，保持既有行为）；wechat=微信扫码
     login_mode: str = "password"
     #: 微信扫码相关端点与轮询参数

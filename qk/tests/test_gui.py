@@ -1007,3 +1007,140 @@ def test_start_cancels_pending_auto_query(gui_app: Any, json_env: Any, window: A
     win.on_start()                      # 演练模式，只打印计划
     gui_app.processEvents()
     assert win._auto_query_cancelled is True
+
+
+# ==========================================================================
+# 账号密码登录（带图片验证码）
+#
+# 需求：除扫码外，还要能用账号密码登录，并把**图片验证码**显示出来让用户填。
+#
+# 真实契约（2026-10-15 抓包）：
+#   取图 GET /lyuapServer/kaptcha?_t=<ms>&uid= → {uid, content: data:image/png;base64,…}
+#   登录 POST /lyuapServer/v1/tickets，loginType 空串 + RSA 密码 + id/code
+#   失败仍是 HTTP 200，原因在 data.code（NOUSER / CODEFALSE）
+# ==========================================================================
+
+
+def test_login_has_two_tabs(gui_app: Any, json_env: Any, window: Any) -> None:
+    """①区用标签页区分「扫码登录」与「账号密码登录」，默认停在扫码。"""
+    _server, config = json_env
+    win = window(config)
+    assert win.tabs_login.count() == 2
+    assert win.tabs_login.tabText(0) == "扫码登录"
+    assert win.tabs_login.tabText(1) == "账号密码登录"
+    assert win.tabs_login.currentIndex() == 0
+    assert win._captcha_uid == "", "未进入密码登录前不该有验证码 uid"
+
+
+def test_switching_to_password_tab_fetches_captcha(
+    gui_app: Any, json_env: Any, window: Any
+) -> None:
+    """切到「账号密码登录」时自动取一张验证码，省掉一次点击。"""
+    _server, config = json_env
+    win = window(config)
+    win.tabs_login.setCurrentIndex(1)
+    assert pump(gui_app, lambda: bool(win._captcha_uid), timeout=15), "未自动获取验证码"
+    assert len(win._captcha_uid) == 32
+    assert win.label_captcha.pixmap() is not None and not win.label_captcha.pixmap().isNull(), \
+        "验证码图片应当被画到 label 上"
+    assert pump(gui_app, lambda: not win.is_busy(), timeout=15)
+
+
+def test_password_login_validates_inputs_before_running(
+    gui_app: Any, json_env: Any, window: Any
+) -> None:
+    """缺哪一项就提示哪一项，且**不发请求**（避免无谓的登录尝试）。"""
+    _server, config = json_env
+    win = window(config)
+    win.tabs_login.setCurrentIndex(1)
+    assert pump(gui_app, lambda: bool(win._captcha_uid), timeout=15)
+    assert pump(gui_app, lambda: not win.is_busy(), timeout=15)
+    win.edit_username.clear()                  # 账号会被配置预填，这里要显式清空
+    win.edit_password.clear()
+    win.edit_captcha.clear()
+    win.log_view.clear()
+
+    win.on_password_login()                    # 账号、密码、验证码都空
+    log = win.log_view.toPlainText()
+    assert "账号" in log
+    assert not win.is_busy(), "不该发起登录任务"
+
+    win.edit_username.setText("20230001")
+    win.log_view.clear()
+    win.on_password_login()
+    assert "密码" in win.log_view.toPlainText()
+
+    win.edit_password.setText("some-password")
+    win.log_view.clear()
+    win.on_password_login()
+    assert "验证码" in win.log_view.toPlainText()
+    assert not win.is_busy()
+
+
+def test_password_login_success_clears_password_and_uid(
+    gui_app: Any, json_env: Any, window: Any
+) -> None:
+    """登录成功后：密码框清空、uid 作废（下次要重新取图）、会话被保存。"""
+    server, config = json_env
+    win = window(config)
+    # 顺序很关键：期望答案必须在**取图之前**设好 ——
+    # mock 在 handle_kaptcha 里就把「当时」的答案记到该 uid 名下了，
+    # 取完图再改 expected 对这张图无效。
+    server.state.kaptcha_expected = "24"
+    win.tabs_login.setCurrentIndex(1)
+    assert pump(gui_app, lambda: bool(win._captcha_uid), timeout=15)
+
+    win.edit_username.setText(server.config.student_id)
+    win.edit_password.setText(server.config.password)
+    win.edit_captcha.setText("24")
+    win.on_password_login()
+
+    assert pump(gui_app, lambda: not win.is_busy(), timeout=25), "登录任务未结束"
+    assert win.edit_password.text() == "", "登录成功后应清空密码框"
+    assert win.edit_captcha.text() == ""
+    assert win._captcha_uid == "", "旧验证码已被消费，必须作废"
+    assert "已登录" in win.label_session.text(), win.label_session.text()
+
+
+def test_password_login_failure_refreshes_captcha(
+    gui_app: Any, json_env: Any, window: Any
+) -> None:
+    """验证码填错时自动换一张 —— 失败后旧 uid 已被消费，不换就永远登不上。"""
+    server, config = json_env
+    win = window(config)
+    server.state.kaptcha_expected = "24"
+    win.tabs_login.setCurrentIndex(1)
+    assert pump(gui_app, lambda: bool(win._captcha_uid), timeout=15)
+    first_uid = win._captcha_uid
+
+    win.edit_username.setText(server.config.student_id)
+    win.edit_password.setText(server.config.password)
+    win.edit_captcha.setText("99")            # 故意填错
+    win.on_password_login()
+
+    assert pump(gui_app, lambda: not win.is_busy(), timeout=25)
+    assert pump(gui_app, lambda: win._captcha_uid not in ("", first_uid), timeout=15), \
+        "失败后应自动换一张验证码（uid 必须变化）"
+    assert "CODEFALSE" in win.log_view.toPlainText() or "验证码" in win.log_view.toPlainText()
+    assert win.edit_password.text() != "", "失败时应保留已填的账号密码，别让用户重打"
+
+
+def test_password_login_never_logs_the_password(
+    gui_app: Any, json_env: Any, window: Any
+) -> None:
+    """日志里**绝不能**出现密码明文。"""
+    server, config = json_env
+    win = window(config)
+    server.state.kaptcha_expected = "24"
+    win.tabs_login.setCurrentIndex(1)
+    assert pump(gui_app, lambda: bool(win._captcha_uid), timeout=15)
+
+    secret = "very-secret-password-xyz"
+    win.edit_username.setText(server.config.student_id)
+    win.edit_password.setText(secret)
+    win.edit_captcha.setText("99")
+    win.on_password_login()
+    assert pump(gui_app, lambda: not win.is_busy(), timeout=25)
+
+    assert secret not in win.log_view.toPlainText()
+    assert win.label_session.text().find(secret) == -1

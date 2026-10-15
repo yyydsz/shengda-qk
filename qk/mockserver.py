@@ -192,6 +192,12 @@ class MockState:
         self.qr_polls: dict[str, int] = {}
         # CAS REST：TGT -> 用户名（ST 复用上面的 tickets/ticket_services）
         self.tgt_users: dict[str, str] = {}
+        #: 图片验证码：uid -> 正确答案。真实系统里 `GET /lyuapServer/kaptcha` 返回
+        #: 一张画着算术题的 PNG 和一个 uid，登录时要把 uid（字段 id）与答案（code）
+        #: 一起提交 —— 服务端靠 uid 找到这张图对应的答案。
+        self.kaptcha_answers: dict[str, str] = {}
+        #: 当前该填的验证码答案（mock 可指定；None 表示随机一道两位数以内的算式）
+        self.kaptcha_expected: str | None = None
         # 青果 Kingosoft：菜单上下文（真实系统里缺它就会报「无效访问请求」）
         self.kingosoft_menu_context: str = ""
         # Kingosoft 写操作的解密后的最后一条参数（供用例断言）
@@ -212,6 +218,7 @@ class MockState:
             self.select_expired = False
             self.qr_polls.clear()
             self.tgt_users.clear()
+            self.kaptcha_answers.clear()
             self.kingosoft_menu_context = ""
             self.kingosoft_last_write = ""
 
@@ -412,6 +419,14 @@ LOGIN_PAGE = """<!DOCTYPE html>
 CAPTCHA_BLOCK = """<label>验证码 <input type="text" name="captcha" id="captcha"></label>
 <img id="captchaImg" src="/lyuapServer/captcha" alt="验证码">"""
 
+#: mock 图片验证码用的最小合法 PNG（1×1 透明）。
+#: 测试只要求「能被 QPixmap/base64 正常解码」，不要求能认出算式；
+#: 真实系统给的是一张画着算术题（如 ``6 * 4 =``）的 100×25 PNG。
+_MOCK_PNG_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
+    "+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
+)
+
 PORTAL_PAGE = """<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8"><title>一站式服务门户（mock）</title></head>
 <body>
@@ -502,7 +517,11 @@ class MockHandler(BaseHTTPRequestHandler):
                 return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
             except ValueError:
                 return {}
-        return {key: values[0] for key, values in parse_qs(raw).items()}
+        # keep_blank_values=True 很关键：账号密码登录靠**空串** loginType 区分
+        # 「密码登录」与「扫码建会话」（前者空串、后者 "3"）。默认的 parse_qs
+        # 会把 `loginType=` 这种空值参数整个丢掉，mock 就永远匹配不上密码登录路径。
+        return {key: values[0] for key, values in
+                parse_qs(raw, keep_blank_values=True).items()}
 
     # ------------------------------------------------------------- 青果 Kingosoft
     def handle_kingosoft_temp(self, method: str) -> None:
@@ -696,6 +715,8 @@ class MockHandler(BaseHTTPRequestHandler):
             return self.handle_create_qrcode()
         if path == "/lyuapServer/captcha":
             return self._send(200, "MOCK", content_type="image/png", headers={"X-Mock-Captcha": "1"})
+        if path == "/lyuapServer/kaptcha":
+            return self.handle_kaptcha()
         if path == "/lyuapServer/validate":
             return self.handle_validate(query.get("ticket", ""), query.get("service", ""))
         if path == "/lyuapServer/logout":
@@ -821,27 +842,91 @@ class MockHandler(BaseHTTPRequestHandler):
         })
 
     # ------------------------------------------------------------- CAS REST
+    def handle_kaptcha(self) -> None:
+        """图片验证码：返回 data URI 图 + uid（与真实响应同构）。
+
+        真实契约（2026-10-15 在登录页实测）::
+
+            GET /lyuapServer/kaptcha?_t=<毫秒时间戳>&uid=
+            → {"kaptchaType":"1","uid":"<32位hex>","content":"data:image/png;base64,…"}
+
+        每次调用产生**新的 uid**；登录时必须回传该 uid（字段 ``id``）与答案（``code``），
+        服务端靠 uid 找回这张图对应的答案 —— 所以「换一张」之后旧答案立刻作废。
+        这里用一张 1×1 的合法 PNG（测试只要求能被解码，不要求能认出算式）。
+        """
+        uid = secrets.token_hex(16)
+        expected = self.state.kaptcha_expected
+        if expected is None:
+            expected = str(secrets.randbelow(10) * secrets.randbelow(10))
+        with self.state.lock:
+            self.state.kaptcha_answers[uid] = str(expected)
+        content = "data:image/png;base64," + _MOCK_PNG_B64
+        self._send(200, json.dumps({"kaptchaType": "1", "uid": uid, "content": content},
+                                   ensure_ascii=False),
+                   content_type="application/json;charset=UTF-8")
+
     def handle_rest_tickets(self, body: dict[str, str]) -> None:
         """REST 第一步：表单编码 ``username``/``password``/``service``/``loginType``。
 
-        真实前端（CAS 登录页的 app bundle）就是这么发的；成功时 JSON 里给 ``data.tgt``，
-        失败时返回 ``success=false`` + ``请求操作失败!``（与真实系统一致）。
+        两种登录方式（2026-10-15 抓真实请求核对）：
+
+        * ``loginType="3"``（扫码建会话）：``password`` 是**明文**；
+        * ``loginType=""``（账号密码登录）：``password`` 是 **RSA 密文**，
+          且必须带验证码 ``id``（uid）与 ``code``（答案）。
+
+        失败时**照样返回 HTTP 200**，只在 ``data.code`` 里给原因 ——
+        这与真实系统一致（实测 ``NOUSER`` / ``CODEFALSE``），
+        客户端据此才能给出「账号不存在」「验证码错误」这类可操作提示。
         """
         config = self.config
         if not config.rest_tickets_enabled:
             return self._send(404, "not found", content_type="text/plain; charset=utf-8")
+        user = body.get("username") or body.get("userName") or ""
+        password = body.get("password") or body.get("passWord") or ""
+        login_type = body.get("loginType")
+        if login_type is None:
+            login_type = "3"
+
+        def reject(code: str) -> None:
+            self._negotiated({
+                "meta": {"success": True, "statusCode": 200, "message": "ok"},
+                "data": {"code": code},
+            })
+
+        # ---- 账号密码登录：先验验证码，再验账号，最后验密码 ----
+        if login_type == "":
+            uid = (body.get("id") or "").strip()
+            answer = (body.get("code") or "").strip()
+            with self.state.lock:
+                want = self.state.kaptcha_answers.pop(uid, None) if uid else None
+            if want is None or answer != want:
+                return reject("CODEFALSE")
+            if user != config.student_id:
+                return reject("NOUSER")
+            # 密码是 RSA 密文，服务端没有私钥也没关系：加密是**确定性**的，
+            # 用它自己的公钥重新加密一遍已知密码再比对即可。
+            from .adapters.cas_rsa import encrypt_password  # noqa: PLC0415
+
+            if password != encrypt_password(config.password):
+                return reject("PWDERR")
+            return self._issue_rest_session(user, body.get("service") or "")
+
+        # ---- 扫码建会话：明文密码 ----
         accepted = {
             (config.student_id, config.password),
             (config.scan_user, config.scan_password),
         }
-        user = body.get("username") or body.get("userName") or ""
-        password = body.get("password") or body.get("passWord") or ""
         if (user, password) not in accepted:
             return self._negotiated({"meta": {"success": False, "statusCode": 500,
                                               "message": "请求操作失败!"}, "data": None})
+        return self._issue_rest_session(user, body.get("service") or "")
+
+    def _issue_rest_session(self, user: str, service: str) -> None:
+        """两步 REST 建会话的第一步：发放 TGT（必要时同时内联 ticket）。"""
+        config = self.config
         tgt = f"TGT-{secrets.token_hex(8)}"
         st = f"ST-{secrets.token_hex(8)}"
-        service = body.get("service") or f"{self.base_url()}/"
+        service = service or f"{self.base_url()}/"
         with self.state.lock:
             self.state.tgt_users[tgt] = user
             if config.rest_inline_ticket_invalid:

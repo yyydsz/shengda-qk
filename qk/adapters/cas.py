@@ -305,8 +305,9 @@ class CasLoginAdapter(LoginAdapter):
 
     # ------------------------------------------------------------------ REST 建会话
     def login_with_rest(self, user_name: str, password: str, *, service: str | None = None,
-                        login_type: str = "3", identifier: str = "", code: str = "") -> SessionInfo:
-        """用平台的 ``/v1/tickets`` 接口建立会话（微信扫码后的建会话路径）。
+                        login_type: str | None = None, identifier: str = "",
+                        code: str = "") -> SessionInfo:
+        """用平台的 ``/v1/tickets`` 接口建立会话。
 
         **契约来自真实前端包（2026-10 实测确认）**：CAS 登录页加载的
         ``assets/js/app.4f499a503cbced5ac091.js`` 里，所有登录方式最终都调用
@@ -331,11 +332,14 @@ class CasLoginAdapter(LoginAdapter):
         target_service = service or self.config.cas.service
         # 与真实前端一致的字段名（前端用 qs.stringify，未定义的 id/code 会被**省略**，
         # 因此这里只在有值时才带上，避免空串被服务端当成非法参数）
+        #
+        # ``login_type`` 的默认值用 None 而不是 "3"：账号密码登录要发**空串**
+        # （``loginType=``），用 ``or "3"`` 会把空串误换成扫码的 "3"。
         body = {
             "username": user_name,
             "password": password,
             "service": target_service,
-            "loginType": login_type or "3",
+            "loginType": "3" if login_type is None else login_type,
         }
         if identifier:
             body["id"] = identifier
@@ -349,6 +353,13 @@ class CasLoginAdapter(LoginAdapter):
             raise AuthError(
                 "REST 建会话被拒绝（HTTP %d）：账号或密码不正确。" % created.status
             )
+        # 先看业务错误码：登录失败时服务端**照样返回 HTTP 200**，
+        # 只在 data.code 里说明原因（实测 NOUSER）。不先判这个，
+        # 用户只会看到「没有返回 TGT」，完全不知道该改什么。
+        failure = self._login_failure_reason(created)
+        if failure:
+            self._session_info = None
+            raise AuthError(failure)
         tgt = self._extract_tgt(created, ticket_url)
         seeded = self._seed_tgt_cookie(tgt)
 
@@ -520,6 +531,115 @@ class CasLoginAdapter(LoginAdapter):
                     "服务端渲染表单时才可能成功（升达的登录页是 SPA，没有表单）。\n"
                     "  可改用账号密码登录：python -m qk login（先在 config.yaml 填好学号与密码）"
                 ) from form_error
+
+    # ------------------------------------------------------------ 图片验证码
+    def fetch_captcha(self) -> tuple[str, bytes]:
+        """取一张图片验证码：返回 ``(uid, PNG 字节)``。
+
+        真实契约（2026-10-15 在登录页实测）：
+
+        .. code-block:: text
+
+            GET {cas}/lyuapServer/kaptcha?_t=<毫秒时间戳>&uid=
+            → {"kaptchaType":"1","uid":"347fdabc…","content":"data:image/png;base64,…"}
+
+        ``uid`` 必须原样随登录提交（字段名 ``id``）——服务端靠它把「这张图」和
+        「用户填的答案」对上；丢了或换了就会判定验证码错误。
+
+        图片是 **base64 data URI**（不是独立图片地址），这里解出原始字节，
+        交给界面显示。
+        """
+        import base64  # noqa: PLC0415 - 仅此处用到，避免顶层再增依赖
+        import time  # noqa: PLC0415
+
+        base = self.cas_base()
+        path = (self.config.cas.captcha_path or "/lyuapServer/kaptcha").strip()
+        url = f"{base}{path}?_t={int(time.time() * 1000)}&uid="
+        response = self.session.get(
+            url,
+            headers={
+                "Accept": "application/json, text/plain, */*",
+                "X-Requested-With": "XMLHttpRequest",
+                "Referer": self.config.cas.login_url,
+            },
+        )
+        payload = response.json()
+        if not isinstance(payload, Mapping):
+            raise AuthError(f"取验证码返回了非预期内容（HTTP {response.status}）。")
+        data = payload
+        inner = payload.get("data")
+        if isinstance(inner, Mapping):
+            data = inner
+        uid = str(data.get("uid") or "").strip()
+        content = str(data.get("content") or "").strip()
+        if not content:
+            raise AuthError(
+                "取验证码失败：响应里没有 content 字段"
+                f"（HTTP {response.status}，字段：{sorted(str(k) for k in data)}）。"
+            )
+        if "," in content and content.startswith("data:"):
+            content = content.split(",", 1)[1]
+        try:
+            image = base64.b64decode(content)
+        except (ValueError, TypeError) as exc:
+            raise AuthError(f"验证码图片解码失败：{exc}") from exc
+        return uid, image
+
+    def login_with_password(self, user_name: str, password: str, captcha_code: str, *,
+                            captcha_uid: str = "", service: str | None = None) -> SessionInfo:
+        """**账号密码 + 图片验证码**登录（网页版的密码登录路径）。
+
+        与扫码建会话共用 ``POST /lyuapServer/v1/tickets``，但有三处不同
+        （2026-10-15 抓真实请求核对）：
+
+        ============  ====================  ====================
+        字段           扫码（loginType=3）    密码登录（loginType=空）
+        ============  ====================  ====================
+        ``loginType``  ``"3"``               ``""``（空串）
+        ``password``   **明文**              **RSA 加密后的十六进制串**
+        ``id``/``code`` 不带                  验证码的 ``uid`` / 用户填的答案
+        ============  ====================  ====================
+
+        RSA 算法见 :mod:`qk.adapters.cas_rsa` —— 已用浏览器真实密文验证逐字符一致。
+        """
+        from .cas_rsa import encrypt_password  # noqa: PLC0415
+
+        if not user_name or not password:
+            raise AuthError("账号密码登录需要同时提供账号与密码。")
+        encrypted = encrypt_password(password)
+        # 注意 login_type 传**空串**：服务端据此走「密码登录」分支，
+        # 也因此才要求 RSA 密文而不是明文。
+        return self.login_with_rest(
+            user_name, encrypted, service=service, login_type="",
+            identifier=captcha_uid, code=captcha_code,
+        )
+
+    #: 登录失败时服务端在 ``data.code`` 里给的原因码 → 给用户看的话。
+    #: **只收录实测确认过的**（2026-10-15 用假凭据真打接口得到）：
+    #:   * ``NOUSER``     —— 账号不存在（乱填学号）
+    #:   * ``CODEFALSE``  —— 验证码为空/错误（故意不填验证码）
+    #: 其它码（例如密码错误的码）**尚未实测到，因此不猜、不编**，
+    #: 一律原样回显 ``code`` 让用户能看到并反馈。
+    _LOGIN_CODE_HINTS: Mapping[str, str] = {
+        "NOUSER": "账号不存在（请核对学号）",
+        "CODEFALSE": "验证码错误或已过期（点「换一张」重新获取再填）",
+    }
+
+    @classmethod
+    def _login_failure_reason(cls, response: Any) -> str:
+        """若响应表示登录失败，返回给用户看的说明；成功则返回空串。"""
+        payload = response.json()
+        if not isinstance(payload, Mapping):
+            return ""
+        data = payload.get("data")
+        if not isinstance(data, Mapping):
+            return ""
+        code = str(data.get("code") or "").strip()
+        if not code:
+            return ""
+        hint = cls._LOGIN_CODE_HINTS.get(code.upper(), "")
+        detail = f"（{hint}）" if hint else "（原因码未知，请把这条反馈给开发者）"
+        return f"登录被拒绝：服务端返回 {code}{detail}"
 
     @staticmethod
     def _response_keys(response: Any) -> list[str]:

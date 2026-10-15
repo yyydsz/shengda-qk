@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from .adapters.base import AdapterError, filter_excluded_attrs
+from .adapters.cas import CasLoginAdapter
 from .adapters.jwgl import build_course_adapter
 from .adapters.wechat import WeChatQrLoginAdapter
 from .config import AppConfig, ConfigError, CourseTarget, load_config
@@ -220,6 +221,47 @@ class GuiBackend:
         log(f"会话已保存：{redacted['saved_at']} 保存、{redacted['expires_at']} 过期")
         return {"ok": True, "student_id": info.student_id, "view": redacted, "saved": True}
 
+    # ------------------------------------------------------------ 账号密码登录
+    def fetch_captcha(self, *, log: Callable[[str], None]) -> dict[str, Any]:
+        """取一张图片验证码（在工作线程里执行）。
+
+        返回 ``{ok, uid, image, message}``：``image`` 是 PNG 原始字节，
+        由界面解成 QPixmap 显示；``uid`` 必须随登录一起回传。
+        """
+        self._trace("captcha")
+        adapter = CasLoginAdapter(self.config, self.session)
+        try:
+            uid, image = adapter.fetch_captcha()
+        except (AdapterError, ValueError) as exc:
+            return {"ok": False, "message": f"取验证码失败：{exc}"}
+        log(f"已获取验证码（uid {uid[:8]}…）—— 图片里是一道算术题，把结果填进「验证码」框")
+        return {"ok": True, "uid": uid, "image": image}
+
+    def password_login(self, username: str, password: str, captcha_code: str, *,
+                       captcha_uid: str, log: Callable[[str], None]) -> dict[str, Any]:
+        """账号密码 + 图片验证码登录，并把会话落盘（在工作线程里执行）。
+
+        密码在适配器里用 RSA 加密后提交（见 ``qk.adapters.cas_rsa``）；
+        本方法**不记录密码**，日志里只出现账号。
+        """
+        self._trace("login")
+        adapter = CasLoginAdapter(self.config, self.session)
+        try:
+            info = adapter.login_with_password(
+                username, password, captcha_code, captcha_uid=captcha_uid)
+        except AdapterError as exc:
+            return {"ok": False, "message": str(exc)}
+        if not info.ok:
+            return {"ok": False, "message": info.message}
+        if self.mock:
+            log("离线演示模式：会话仅保留在内存中，未写入磁盘。")
+            return {"ok": True, "student_id": info.student_id, "view": {}, "saved": False}
+        view = self.store.save(info.cookies, student_id=info.student_id,
+                               service_url=self.config.cas.service, source="password")
+        redacted = view.redacted()
+        log(f"会话已保存：{redacted['saved_at']} 保存、{redacted['expires_at']} 过期")
+        return {"ok": True, "student_id": info.student_id, "view": redacted, "saved": True}
+
     # ------------------------------------------------------------ 查询
     def save_exclude_patterns(self, patterns: Sequence[str]) -> str:
         """把排除条件写进当前配置文件（``config.config_path``）。
@@ -380,16 +422,19 @@ class MainWindow:
                 # 早期默认 1180x820，五个区的最小高度加起来约 910px，必然有一个被压扁
                 # ——被压的恰好是课程表格（实测只剩 ~50px，117 门课看起来「只有一行」）。
                 # 后来又反馈「日志窗口太小」，于是**按屏幕可用高度自适应**：
-                # 尽量用满屏幕高度（留 20px 给任务栏/边框），并把多出来的空间给日志区。
-                # 注意下限取 1200x960 —— 这是先前调好的基准：再小就会把②区课程表格
+                # 尽量用满屏幕高度，并把多出来的空间给日志区。
+                # 上限取 1000 而不是屏幕可用高度（本机 1032）：``resize`` 设的是
+                # **客户区**，Windows 还会加约 31px 的标题栏，两者相加必须留在
+                # 可用高度内，否则窗口下沿会被任务栏吃掉。
+                # 下限取 1200x960 —— 这是先前调好的基准：再小就会把②区课程表格
                 # 压到只能显示 1 行（offscreen 平台的虚拟屏幕只有 ~800x600，
                 # 若按它自适应会把窗口缩到 760 高，直接触发该回归）。
                 screen = QtWidgets.QApplication.primaryScreen()
                 avail = screen.availableGeometry() if screen is not None else None
-                want_w, want_h = 1280, 1010
+                want_w, want_h = 1280, 1000
                 if avail is not None:
                     want_w = min(want_w, max(1200, avail.width() - 40))
-                    want_h = min(want_h, max(960, avail.height() - 20))
+                    want_h = min(want_h, max(960, avail.height() - 31))
                 self.resize(want_w, want_h)
                 self.config = config
                 self.backend = backend or GuiBackend(config, log=self.append_log,
@@ -405,6 +450,8 @@ class MainWindow:
                 #: 用户手动查询/开始抢课会置位它，让挂起的「登录后自动查询」作废，
                 #: 避免自动任务和用户操作抢忙碌态。
                 self._auto_query_cancelled = False
+                #: 当前这张验证码的 uid（服务端要求随登录回传；换图必须换 uid）
+                self._captcha_uid = ""
                 self._build_ui()
                 self._wire()
                 self._queried_once = False
@@ -424,17 +471,27 @@ class MainWindow:
                 root = QtWidgets.QVBoxLayout(central)
 
                 # ① 登录与会话
+                # 两种登录方式用**标签页**切换，而不是上下叠放：叠放会让①区高出一大截，
+                # 只能从②课程表或⑤日志里抢空间（有布局测试盯着，两个都有下限）。
                 box_session = QtWidgets.QGroupBox("① 登录与会话")
-                s_layout = QtWidgets.QHBoxLayout(box_session)
+                s_layout = QtWidgets.QVBoxLayout(box_session)
+                self.tabs_login = QtWidgets.QTabWidget()
+                self.tabs_login.setObjectName("tabs_login")
+
+                # ---- 标签页 1：扫码登录 ----
+                tab_qr = QtWidgets.QWidget()
+                qr_row = QtWidgets.QHBoxLayout(tab_qr)
+                qr_row.setContentsMargins(4, 4, 4, 4)
                 self.label_qr = QtWidgets.QLabel("未获取二维码")
                 self.label_qr.setObjectName("label_qr")
                 # 二维码只在登录时看一次，日志区却是全程都在看 —— 所以把这里收窄，
                 # 把高度让给⑤运行日志（用户反馈「日志窗口太小」）。
-                # 128px 仍能正常扫码（服务端二维码原图 220x220，等比缩小）。
-                self.label_qr.setFixedSize(128, 128)
+                # 108px 仍能扫码：服务端原图 220x220，等比缩小后微信照样识别；
+                # 再大就会把①区顶高，连带把窗口撑过屏幕可用高度（~1032）。
+                self.label_qr.setFixedSize(108, 108)
                 self.label_qr.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
                 self.label_qr.setFrameShape(QtWidgets.QFrame.Shape.Box)
-                s_layout.addWidget(self.label_qr)
+                qr_row.addWidget(self.label_qr)
                 right = QtWidgets.QVBoxLayout()
                 self.label_session = QtWidgets.QLabel("会话状态：未检查")
                 self.label_session.setObjectName("label_session")
@@ -449,7 +506,62 @@ class MainWindow:
                     row.addWidget(button)
                 right.addLayout(row)
                 right.addStretch(1)
-                s_layout.addLayout(right, 1)
+                qr_row.addLayout(right, 1)
+                self.tabs_login.addTab(tab_qr, "扫码登录")
+
+                # ---- 标签页 2：账号密码登录（带图片验证码）----
+                tab_pwd = QtWidgets.QWidget()
+                pwd_layout = QtWidgets.QVBoxLayout(tab_pwd)
+                pwd_layout.setContentsMargins(4, 4, 4, 4)
+                # 第一行：账号 + 密码
+                cred_row = QtWidgets.QHBoxLayout()
+                self.edit_username = QtWidgets.QLineEdit()
+                self.edit_username.setObjectName("edit_username")
+                self.edit_username.setPlaceholderText("账号 / 学号")
+                # 配置里已有学号就预填（只填账号，**不回填密码**）
+                if config.creds.student_id:
+                    self.edit_username.setText(config.creds.student_id)
+                self.edit_password = QtWidgets.QLineEdit()
+                self.edit_password.setObjectName("edit_password")
+                self.edit_password.setPlaceholderText("密码")
+                self.edit_password.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
+                cred_row.addWidget(QtWidgets.QLabel("账号："))
+                cred_row.addWidget(self.edit_username, 2)
+                cred_row.addWidget(QtWidgets.QLabel("密码："))
+                cred_row.addWidget(self.edit_password, 3)
+                pwd_layout.addLayout(cred_row)
+                # 第二行：验证码图片 + 输入 + 换一张 + 登录
+                cap_row = QtWidgets.QHBoxLayout()
+                self.label_captcha = QtWidgets.QLabel("点「换一张」获取验证码")
+                self.label_captcha.setObjectName("label_captcha")
+                # 服务端验证码原图 100x25（一道算术题，如 "6 * 4 ="）。
+                # 给到 128x34：既完整显示又略微放大，比 96x40 更好认。
+                self.label_captcha.setFixedSize(128, 34)
+                self.label_captcha.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+                self.label_captcha.setFrameShape(QtWidgets.QFrame.Shape.Box)
+                self.label_captcha.setToolTip(
+                    "服务端的图片验证码（一道算术题，如 6 * 4 =），"
+                    "把算出的结果填进右边输入框")
+                self.edit_captcha = QtWidgets.QLineEdit()
+                self.edit_captcha.setObjectName("edit_captcha")
+                self.edit_captcha.setPlaceholderText("验证码答案")
+                self.edit_captcha.setMaximumWidth(140)
+                self.btn_captcha_refresh = QtWidgets.QPushButton("换一张")
+                self.btn_captcha_refresh.setObjectName("btn_captcha_refresh")
+                self.btn_password_login = QtWidgets.QPushButton("登录")
+                self.btn_password_login.setObjectName("btn_password_login")
+                self.btn_password_login.setDefault(True)
+                cap_row.addWidget(QtWidgets.QLabel("验证码："))
+                cap_row.addWidget(self.label_captcha)
+                cap_row.addWidget(self.edit_captcha)
+                cap_row.addWidget(self.btn_captcha_refresh)
+                cap_row.addStretch(1)
+                cap_row.addWidget(self.btn_password_login)
+                pwd_layout.addLayout(cap_row)
+                pwd_layout.addStretch(1)
+                self.tabs_login.addTab(tab_pwd, "账号密码登录")
+
+                s_layout.addWidget(self.tabs_login)
 
                 splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Vertical)
                 root.addWidget(splitter, 1)
@@ -629,8 +741,10 @@ class MainWindow:
                 # 为腾出空间：①区二维码 150→128px、「只抢网课」控件并入
                 # 「开始/停止」那一行（不单独占行）。想要更大可以把分隔条往上拖。
                 # 注意：五个区的最小高度之和必须 ≤ 屏幕可用高度（~1032），
-                # 否则 Qt 会把窗口撑高、超出屏幕下沿（实测 1071 就会溢出）。
-                self.log_view.setMinimumHeight(280)
+                # 否则 Qt 会把窗口撑高、超出屏幕下沿。实测各值下限之和为
+                # ①185 + ②216 + ③137 + ④119 + ⑤280 = 937，客户端 1011；
+                # 再加标题栏约 31px 刚好卡在 1042 > 1032 —— 于是收到 260。
+                self.log_view.setMinimumHeight(260)
                 l_layout.addWidget(self.log_view)
                 splitter.addWidget(box_log)
 
@@ -715,6 +829,13 @@ class MainWindow:
                 self.btn_qr_login.clicked.connect(self.on_qr_login)
                 self.btn_session_info.clicked.connect(self.on_session_info)
                 self.btn_session_clear.clicked.connect(self.on_session_clear)
+                # 账号密码登录
+                self.btn_captcha_refresh.clicked.connect(self.on_captcha_refresh)
+                self.btn_password_login.clicked.connect(self.on_password_login)
+                # 输入完验证码直接回车就登录
+                self.edit_captcha.returnPressed.connect(self.on_password_login)
+                self.edit_password.returnPressed.connect(self.on_password_login)
+                self.tabs_login.currentChanged.connect(self.on_login_tab_changed)
                 self.btn_query.clicked.connect(self.on_query)
                 # 授课形式过滤：勾选框一变就重查；输入框回车/失焦时重查
                 self.chk_exclude_offline.toggled.connect(self.on_exclude_changed)
@@ -788,6 +909,92 @@ class MainWindow:
                         QtCore.Qt.AspectRatioMode.KeepAspectRatio,
                         QtCore.Qt.TransformationMode.SmoothTransformation))
                     self.append_log("二维码已显示在窗口左上角，请用微信扫一扫")
+
+            # -------------------------------------------------- 账号密码登录
+            def show_captcha(self, image: bytes) -> None:
+                """把服务端返回的 PNG 字节画到验证码小框里。"""
+                pixmap = QtGui.QPixmap()
+                if image and pixmap.loadFromData(image):
+                    self.label_captcha.setPixmap(pixmap.scaled(
+                        self.label_captcha.size(),
+                        QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+                        QtCore.Qt.TransformationMode.SmoothTransformation))
+                else:
+                    self.label_captcha.setText("图片解码失败")
+
+            def _after_captcha(self, result: Any) -> None:
+                if isinstance(result, dict) and result.get("ok"):
+                    self._captcha_uid = str(result.get("uid") or "")
+                    self.show_captcha(result.get("image") or b"")
+                    self.label_session.setText("会话状态：未登录（已取到验证码，请填写账号密码）")
+                else:
+                    message = (result or {}).get("message", "取验证码失败") \
+                        if isinstance(result, dict) else "取验证码失败"
+                    self._captcha_uid = ""
+                    self.label_captcha.setText("获取失败")
+                    self.append_log(message)
+
+            def on_captcha_refresh(self) -> None:
+                """取/换一张验证码。"""
+                if self.is_busy():
+                    return
+                self.label_captcha.setText("获取中…")
+                self.run_task(
+                    lambda *, log, stop_event: self.backend.fetch_captcha(log=log),
+                    name="获取验证码", with_helpers=True, on_done=self._after_captcha)
+
+            def on_login_tab_changed(self, index: int) -> None:
+                """切到「账号密码登录」时自动取一张验证码，省掉一次点击。"""
+                if index == 1 and not self._captcha_uid and not self.is_busy():
+                    self.on_captcha_refresh()
+
+            def on_password_login(self) -> None:
+                if self.is_busy():
+                    self.append_log("已有任务在运行，请稍候")
+                    return
+                username = self.edit_username.text().strip()
+                password = self.edit_password.text()
+                code = self.edit_captcha.text().strip()
+                # 逐项给出可操作的提示，而不是笼统的"参数不全"
+                if not username:
+                    self.append_log("请先填写账号（学号）")
+                    self.edit_username.setFocus()
+                    return
+                if not password:
+                    self.append_log("请先填写密码")
+                    self.edit_password.setFocus()
+                    return
+                if not self._captcha_uid:
+                    self.append_log("还没有取到验证码：请先点「换一张」")
+                    return
+                if not code:
+                    self.append_log("请填写验证码 —— 照左边图片里的算式算出结果")
+                    self.edit_captcha.setFocus()
+                    return
+                # 日志里只出现账号，**绝不打印密码**
+                self.append_log(f"开始账号密码登录（账号 {username}）…")
+                uid = self._captcha_uid
+                self.run_task(
+                    lambda *, log, stop_event: self.backend.password_login(
+                        username, password, code, captcha_uid=uid, log=log),
+                    name="账号密码登录", with_helpers=True,
+                    on_done=self._after_password_login)
+
+            def _after_password_login(self, result: Any) -> None:
+                """复用扫码登录的收尾（成功则设会话标签并自动查询）。"""
+                ok = isinstance(result, dict) and result.get("ok")
+                self._after_login(result)
+                if ok:
+                    self.edit_password.clear()
+                    self.edit_captcha.clear()
+                    # 下次再登录要重新取验证码（旧的已被服务端作废）
+                    self._captcha_uid = ""
+                    return
+                # 失败多半是验证码错误/过期：自动换一张，省得用户自己点
+                self.edit_captcha.clear()
+                self._captcha_uid = ""
+                self.append_log("登录未成功，已自动换一张验证码，请重新填写")
+                self.on_captcha_refresh()
 
             # -------------------------------------------------- 会话动作
             def on_qr_login(self) -> None:
