@@ -505,6 +505,11 @@ class MainWindow:
                     QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
                 self.table_courses.horizontalHeader().setSectionResizeMode(
                     QtWidgets.QHeaderView.ResizeMode.Stretch)
+                # Qt 的 QSplitter 先满足各区的**最小高度**再按份额分配。不设下限时
+                # ②区会被压到只剩一行（117 门课看起来「只有一行」）。
+                # 120px ≈ 表头 + 3 行，是布局测试要求的下限；取最小值以免把窗口撑高
+                # （屏幕可用高度只有 ~1032，五个区的最小高度之和必须塞得进去）。
+                self.table_courses.setMinimumHeight(120)
                 c_layout.addWidget(self.table_courses, 1)
                 splitter.addWidget(box_courses)
 
@@ -580,7 +585,32 @@ class MainWindow:
                 self.btn_stop.setEnabled(False)
                 run_row.addWidget(self.btn_start)
                 run_row.addWidget(self.btn_stop)
-                run_row.addStretch(1)
+                # 「只抢网课」一键模式放在这一行 —— 单独占一行会把④区撑高、
+                # 进而把②区课程表挤掉一行（有布局测试守着）。
+                # 勾上后点「开始」：自动查询 → 排除面授课 → 依次提交。
+                self.chk_online_only = QtWidgets.QCheckBox("只抢网课（非面授）")
+                self.chk_online_only.setObjectName("chk_online_only")
+                self.chk_online_only.setChecked(bool(config.grab.online_only))
+                self.chk_online_only.setToolTip(
+                    "勾选后点「开始」：自动查询课程 → 滤掉属性含「面授」的课 → "
+                    "对剩下的网课依次提交。此时③里的目标被忽略，"
+                    "抢课在达到「最多抢 N 门」后停止。"
+                )
+                self.spin_max_courses = QtWidgets.QSpinBox()
+                self.spin_max_courses.setObjectName("spin_max_courses")
+                self.spin_max_courses.setRange(1, 10)
+                self.spin_max_courses.setValue(int(config.grab.max_courses))
+                self.spin_max_courses.setToolTip(
+                    "「只抢网课」模式下最多抢几门。默认 2 —— 本校通识选修课每人限选两门。"
+                )
+                self.label_online_hint = QtWidgets.QLabel("")
+                self.label_online_hint.setObjectName("label_online_hint")
+                run_row.addSpacing(16)
+                run_row.addWidget(self.chk_online_only)
+                run_row.addWidget(QtWidgets.QLabel("最多抢"))
+                run_row.addWidget(self.spin_max_courses)
+                run_row.addWidget(QtWidgets.QLabel("门"))
+                run_row.addWidget(self.label_online_hint, 1)
                 g_layout.addLayout(run_row)
                 splitter.addWidget(box_control)
 
@@ -593,9 +623,11 @@ class MainWindow:
                 self.log_view.setMaximumBlockCount(self.log_lines)
                 # 日志是抢课时盯得最多的地方：给它一个**较高**的下限，
                 # 否则会被其它区的最小高度挤到只剩十来行。
-                # 为腾出空间，①区的二维码已从 150px 收到 128px（登录时才看一次）。
-                # 想要更大可以把分隔条往上拖（splitter 可拖动）。
-                self.log_view.setMinimumHeight(300)
+                # 为腾出空间：①区二维码 150→128px、「只抢网课」控件并入
+                # 「开始/停止」那一行（不单独占行）。想要更大可以把分隔条往上拖。
+                # 注意：五个区的最小高度之和必须 ≤ 屏幕可用高度（~1032），
+                # 否则 Qt 会把窗口撑高、超出屏幕下沿（实测 1071 就会溢出）。
+                self.log_view.setMinimumHeight(280)
                 l_layout.addWidget(self.log_view)
                 splitter.addWidget(box_log)
 
@@ -605,8 +637,10 @@ class MainWindow:
                 # 在界面上看起来「只有一行」。
                 # 后续反馈「日志窗口太小」，于是把大空间让给要看数据的②区与**⑤日志**，
                 # ①区按二维码实际尺寸给固定高度，③④是列表/按钮，小一点够用。
+                # 再后来④区加了「只抢网课」一行（+29px），必须同步给②区补回来，
+                # 否则课程表格又会被压到 2 行 —— 这个回归由布局测试守着。
                 self._splitter = splitter
-                self._splitter_sizes = [180, 300, 150, 165, 430]
+                self._splitter_sizes = [180, 360, 130, 180, 400]
 
                 # 多余空间一律给日志区（抢课时最常盯的就是它）
                 splitter.setStretchFactor(4, 1)
@@ -690,8 +724,13 @@ class MainWindow:
                 self.btn_target_clear.clicked.connect(self.on_target_clear)
                 self.btn_dry_run.clicked.connect(lambda: self.set_mode(real=False))
                 self.btn_real_submit.clicked.connect(lambda: self.set_mode(real=True))
+                # 「只抢网课」一键模式
+                self.chk_online_only.toggled.connect(self.on_online_only_changed)
+                self.spin_max_courses.valueChanged.connect(self.on_max_courses_changed)
                 self.btn_start.clicked.connect(self.on_start)
                 self.btn_stop.clicked.connect(self.on_stop)
+                # 初始状态同步一次（配置里若已开启，提示文字要立刻显示）
+                self.on_online_only_changed(self.chk_online_only.isChecked())
 
             # -------------------------------------------------- 日志与状态
             def append_log(self, text: str) -> None:
@@ -885,8 +924,13 @@ class MainWindow:
                 if self.is_busy():
                     self.append_log("已有任务在运行，请先等待或点「停止」")
                     return
-                if not self.targets:
-                    self.append_log("还没有抢课目标：请先查询课程并「加入抢课目标」")
+                # 「只抢网课」模式不需要预置目标：开始后会自动查询并生成目标
+                online_only = self.chk_online_only.isChecked()
+                self.config.grab.online_only = online_only
+                self.config.grab.max_courses = int(self.spin_max_courses.value())
+                if not self.targets and not online_only:
+                    self.append_log("还没有抢课目标：请先查询课程并「加入抢课目标」，"
+                                    "或勾选「只抢网课（非面授）」让工具自动查询")
                     return
                 if not self.real_submit_confirmed:
                     # 演练与 `qk run --dry-run` 同口径：只打印计划，**零网络请求**
@@ -900,21 +944,55 @@ class MainWindow:
                 start_at = self.edit_start_at.text().strip() or None
                 self.btn_start.setEnabled(False)
                 self.btn_stop.setEnabled(True)
-                self.append_log(f"开始抢课：模式=真实提交，目标 {len(self.targets)} 个")
+                if online_only:
+                    self.append_log(
+                        f"开始抢课：模式=真实提交，「只抢网课（非面授）」"
+                        f"，最多抢 {self.config.grab.max_courses} 门"
+                        f"（自动查询 → 排除面授课 → 依次提交）"
+                    )
+                else:
+                    self.append_log(f"开始抢课：模式=真实提交，目标 {len(self.targets)} 个")
                 self.run_task(
                     lambda *, log, stop_event: self.backend.make_grabber(
                         self.targets, log=log, stop_event=stop_event
                     ).run(dry_run=False, once=False, start_at=start_at),
                     name="抢课", with_helpers=True, on_done=self._after_grab)
 
+            def on_online_only_changed(self, checked: bool) -> None:
+                """勾选「只抢网课」时给出提示；不勾选则恢复按③的目标抢。"""
+                self.config.grab.online_only = bool(checked)
+                if checked:
+                    self.label_online_hint.setText(
+                        "点「开始」后自动查询 → 排除面授课 → 依次提交；③的目标将被忽略"
+                    )
+                    self.append_log(
+                        "已切到「只抢网课（非面授）」：开始抢课时会自动查询并筛选，"
+                        "不需要先在②查询、也不用往③加目标"
+                    )
+                else:
+                    self.label_online_hint.setText("")
+                    self.append_log("已切回「按抢课目标」模式：抢③列表里的课程")
+
+            def on_max_courses_changed(self, value: int) -> None:
+                self.config.grab.max_courses = int(value)
+
             def print_plan(self) -> None:
                 """演练：只打印将要做什么，**不联网、不提交**（与 ``qk run --dry-run`` 同口径）。"""
                 self.append_log("[dry-run] 演练开始：不会发起任何网络请求，也不会提交选课")
                 self.append_log("[dry-run] 模式：演练（真实提交需先切换到真实模式并二次确认）")
-                self.append_log(f"[dry-run] 抢课目标（{len(self.targets)} 个）：")
-                for target in self.targets:
-                    label = target.course_name or target.course_code or target.teaching_class_id or "(空目标)"
-                    self.append_log(f"[dry-run]   · {label}（{target.teacher or '不限教师'}）")
+                if self.chk_online_only.isChecked():
+                    self.append_log(
+                        f"[dry-run] 「只抢网课（非面授）」：开始后会先自动查询课程、"
+                        f"滤掉属性含「面授」的课，再依次提交，最多抢 "
+                        f"{self.spin_max_courses.value()} 门"
+                    )
+                    self.append_log("[dry-run]   ③里的抢课目标在该模式下会被忽略")
+                else:
+                    self.append_log(f"[dry-run] 抢课目标（{len(self.targets)} 个）：")
+                    for target in self.targets:
+                        label = (target.course_name or target.course_code
+                                 or target.teaching_class_id or "(空目标)")
+                        self.append_log(f"[dry-run]   · {label}（{target.teacher or '不限教师'}）")
                 self.append_log(f"[dry-run] 间隔 {self.spin_interval.value():g}s，"
                                 f"最大尝试 {self.spin_attempts.value()} 次")
                 start_at = self.edit_start_at.text().strip()

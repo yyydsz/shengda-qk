@@ -210,6 +210,16 @@ class GrabConfig:
     drop_if_selected: bool = False
     targets: list[CourseTarget] = field(default_factory=list)
 
+    #: **只抢非面授（网课）**：开启后不依赖 ③ 里预先配置的目标 ——
+    #: 点「开始」会自动查询课程、滤掉面授课（属性含「面授」的），
+    #: 再依次提交，最多抢 ``max_courses`` 门。
+    #: 用途：选课窗口一开就想抢线上课，不用先手动查询、再加目标。
+    online_only: bool = False
+
+    #: ``online_only`` 模式下最多抢几门。默认 2 —— 本校通识选修课
+    #: 每人限选两门，抢多了也会被服务端拒。
+    max_courses: int = 2
+
 
 @dataclass
 class Credentials:
@@ -272,6 +282,8 @@ class AppConfig:
             raise ConfigError("grab.max_attempts 至少为 1")
         if self.grab.retry_interval < 0:
             raise ConfigError("grab.retry_interval 不能为负数")
+        if self.grab.max_courses < 1:
+            raise ConfigError("grab.max_courses 至少为 1")
         if not self.cas.login_url.startswith(("http://", "https://")):
             raise ConfigError("cas.login_url 必须是 http(s) 地址")
         if not self.jwgl.base_url.startswith(("http://", "https://")):

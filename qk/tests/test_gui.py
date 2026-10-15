@@ -844,3 +844,96 @@ def test_log_view_has_usable_height(gui_app: Any, json_env: Any, window: Any) ->
     assert win.log_view.minimumHeight() >= 200, (
         f"日志控件最小高度过低：{win.log_view.minimumHeight()}px"
     )
+
+
+# ==========================================================================
+# 「只抢网课（非面授）」一键模式的界面控件
+#
+# 需求：不再需要「先点查询 → 再加目标 → 再开始」。勾上这个框、点开始，
+# 工具自己查询、自己筛掉面授课、自己提交。
+# ==========================================================================
+
+
+def test_online_only_controls_default_off(gui_app: Any, json_env: Any, window: Any) -> None:
+    """默认不开：仍按③里的目标抢，最多抢门数默认 2。"""
+    _server, config = json_env
+    win = window(config)
+    assert win.chk_online_only.isChecked() is False
+    assert win.spin_max_courses.value() == 2
+    assert win.config.grab.online_only is False
+
+
+def test_online_only_toggle_updates_config(gui_app: Any, json_env: Any, window: Any) -> None:
+    """勾选/取消要同步到 config，并在日志里说清当前是哪种模式。"""
+    _server, config = json_env
+    win = window(config)
+    win.chk_online_only.setChecked(True)
+    gui_app.processEvents()
+    assert win.config.grab.online_only is True
+    assert "只抢网课" in win.log_view.toPlainText()
+
+    win.spin_max_courses.setValue(3)
+    gui_app.processEvents()
+    assert win.config.grab.max_courses == 3
+
+    win.chk_online_only.setChecked(False)
+    gui_app.processEvents()
+    assert win.config.grab.online_only is False
+    assert "已切回" in win.log_view.toPlainText()
+
+
+def test_online_only_reflected_from_config(gui_app: Any, json_env: Any, window: Any) -> None:
+    """配置里已开启时，界面打开就要是勾上的状态。"""
+    _server, config = json_env
+    config.grab.online_only = True
+    config.grab.max_courses = 4
+    win = window(config)
+    assert win.chk_online_only.isChecked() is True
+    assert win.spin_max_courses.value() == 4
+
+
+def test_start_without_targets_is_allowed_in_online_only(
+    gui_app: Any, json_env: Any, window: Any
+) -> None:
+    """核心行为：**没有目标**时，勾了「只抢网课」就不该再拦着不让开始。
+
+    旧行为是无条件提示「还没有抢课目标：请先查询课程并加入抢课目标」，
+    这正好是用户抱怨的那一步多余操作。
+    """
+    _server, config = json_env
+    win = window(config)
+    assert win.targets == []
+
+    win.chk_online_only.setChecked(True)
+    win.on_start()                       # 演练模式（默认）→ 只打印计划
+    gui_app.processEvents()
+    log = win.log_view.toPlainText()
+    assert "还没有抢课目标" not in log, "勾了「只抢网课」就不该再要求先加目标"
+    assert "只抢网课（非面授）" in log
+
+
+def test_start_without_targets_still_blocked_when_online_only_off(
+    gui_app: Any, json_env: Any, window: Any
+) -> None:
+    """没勾「只抢网课」时保持原行为：没有目标就提示去加目标。"""
+    _server, config = json_env
+    win = window(config)
+    win.on_start()
+    gui_app.processEvents()
+    assert "还没有抢课目标" in win.log_view.toPlainText()
+
+
+def test_dry_run_plan_explains_online_only_flow(gui_app: Any, json_env: Any, window: Any) -> None:
+    """演练计划要说清「会自动查询 → 排除面授 → 最多抢几门」，且**零网络请求**。"""
+    _server, config = json_env
+    win = window(config)
+    win.chk_online_only.setChecked(True)
+    win.spin_max_courses.setValue(2)
+    win.log_view.clear()
+    win.on_start()
+    gui_app.processEvents()
+    log = win.log_view.toPlainText()
+    assert "自动查询" in log
+    assert "面授" in log
+    assert "最多抢 2 门" in log
+    assert "没有发起任何网络请求" in log

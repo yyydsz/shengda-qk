@@ -33,6 +33,11 @@ RETRYABLE_OUTCOMES = frozenset({Outcome.FULL, Outcome.RATE_LIMITED, Outcome.UNKN
 #: 这些结果视为“没必要继续”（已选/冲突/找不到/未确认接口）
 TERMINAL_OUTCOMES = frozenset({Outcome.ALREADY_SELECTED, Outcome.CONFLICT, Outcome.NOT_FOUND})
 
+#: 判定「面授课」用的关键词。课程属性形如 ``经济管理类/通识面授课``，
+#: 只要属性里出现「面授」就当作线下课排除。
+#: 用「面授」而不是「面授课」是为了同时覆盖 ``通识面授课``、``面授`` 等写法。
+OFFLINE_ATTR_PATTERN = "面授"
+
 
 # --------------------------------------------------------------------------
 # 时间
@@ -413,9 +418,48 @@ class Grabber:
         )
 
     # ------------------------------------------------------------------ 主流程
+    def discover_online_courses(self, *, keyword: str = "",
+                                limit: int | None = None) -> list[CandidateCourse]:
+        """自动查询课程 → 排除面授课 → 返回可抢的网课（按查询顺序）。
+
+        「只抢网课」模式的核心：用户不必先点查询、再加目标，点开始就自动完成这三步。
+
+        排除规则（任一命中即剔除）：
+
+        * 课程属性含 :data:`OFFLINE_ATTR_PATTERN`（``面授``）→ 线下课；
+        * 已经处于「选中」状态的课 → 抢了也是白提交，还会触发写操作频率限制；
+        * 适配器已按 ``jwgl.exclude_course_attrs`` 做过一轮过滤（见
+          :meth:`~qk.adapters.jwgl.KingosoftCourseAdapter.fetch_candidates`）。
+
+        属性取不到的课程**不会被排除** —— 宁可多试一门，也不要因为字段缺失漏掉线上课。
+        """
+        courses = list(self.course_adapter.fetch_candidates(keyword))
+        self.logger(f"自动查询到 {len(courses)} 门候选课程")
+
+        online = filter_excluded_attrs(courses, [OFFLINE_ATTR_PATTERN])
+        skipped_offline = len(courses) - len(online)
+        if skipped_offline:
+            self.logger(f"已排除面授课 {skipped_offline} 门，剩余线上课 {len(online)} 门")
+
+        picked = [c for c in online
+                  if str((c.raw or {}).get("select_status", "")) != "选中"]
+        skipped_selected = len(online) - len(picked)
+        if skipped_selected:
+            self.logger(f"已跳过已选中的课 {skipped_selected} 门")
+
+        if limit is not None and limit > 0:
+            picked = picked[:limit]
+        return picked
+
     def run(self, *, dry_run: bool = False, once: bool = False,
             start_at: str | None = None) -> GrabReport:
-        """执行整轮抢课。"""
+        """执行整轮抢课。
+
+        ``grab.online_only`` 开启时走「一键抢网课」流程：登录后**自动查询**课程、
+        排除面授课、按顺序抢，最多抢 ``grab.max_courses`` 门 —— 不需要预先配置目标。
+        此时 ``stop_on_success`` 被忽略（它的语义是「抢到一门就收工」，
+        与「抢到 N 门」冲突；这里的停止条件是``max_courses``）。
+        """
         started = self.clock()
         report = GrabReport(
             command="grab",
@@ -424,7 +468,8 @@ class Grabber:
             student_id=self.config.creds.student_id,
         )
 
-        if not self.config.grab.targets:
+        online_only = bool(self.config.grab.online_only)
+        if not self.config.grab.targets and not online_only:
             report.targets.append(
                 TargetReport(target=CourseTarget(), status="NO_TARGET", message="配置里没有任何抢课目标")
             )
@@ -437,15 +482,59 @@ class Grabber:
         except SessionExpiredError:
             report.logged_in = self.ensure_login(force=True, dry_run=dry_run)
 
-        for target in sorted(self.config.grab.targets, key=lambda item: item.priority):
+        # ---- 「只抢网课」：自动查询并生成目标 ----
+        targets = sorted(self.config.grab.targets, key=lambda item: item.priority)
+        if online_only:
+            limit = max(1, int(self.config.grab.max_courses))
+            self.logger(f"「只抢网课（非面授）」模式：自动查询，最多抢 {limit} 门")
+            try:
+                discovered = self.discover_online_courses(limit=limit)
+            except AdapterError as exc:
+                report.targets.append(TargetReport(
+                    target=CourseTarget(), status="ERROR",
+                    message=f"自动查询课程失败：{exc}",
+                ))
+                discovered = []
+            if not discovered:
+                if not report.targets:
+                    report.targets.append(TargetReport(
+                        target=CourseTarget(), status="NO_MATCH",
+                        message="当前没有可抢的非面授（网课）课程",
+                    ))
+                report.success = False
+                report.relogins = self.relogins
+                report.finished_at = self.clock().strftime("%Y-%m-%d %H:%M:%S")
+                report.stats = {"targets": len(report.targets), "attempts": 0,
+                                "success": 0, "dry_run": dry_run}
+                return report
+            targets = [
+                CourseTarget(course_code=course.course_code,
+                             course_name=course.course_name,
+                             priority=index)
+                for index, course in enumerate(discovered)
+            ]
+            for item in targets:
+                self.logger(f"自动加入目标：{item.course_name or item.course_code}")
+
+        # ---- 逐个目标抢课 ----
+        grabbed = 0
+        for target in targets:
             self.logger(f"开始处理目标：{target.course_name or target.course_code or target.teaching_class_id}")
             target_report = self._work_target_with_relogin(target, dry_run=dry_run, once=once)
             report.targets.append(target_report)
             self.logger(f"目标结果：{target_report.status}（{target_report.message}）")
 
-            if target_report.status in ("SUCCESS", "DRY_RUN") and self.config.grab.stop_on_success:
-                self.logger("已抢到目标课程，按配置停止后续目标")
-                break
+            if target_report.status in ("SUCCESS", "DRY_RUN"):
+                grabbed += 1
+                if online_only:
+                    # 停止条件由 max_courses 决定（discovered 已按该上限裁剪）
+                    if grabbed >= len(targets):
+                        self.logger(f"已处理完全部 {grabbed} 门目标")
+                        break
+                    continue
+                if self.config.grab.stop_on_success:
+                    self.logger("已抢到目标课程，按配置停止后续目标")
+                    break
 
         report.success = any(item.status == "SUCCESS" for item in report.targets)
         report.relogins = self.relogins
@@ -484,6 +573,7 @@ def build_grabber(
 __all__ = [
     "Grabber",
     "GrabReport",
+    "OFFLINE_ATTR_PATTERN",
     "RETRYABLE_OUTCOMES",
     "TERMINAL_OUTCOMES",
     "TargetReport",

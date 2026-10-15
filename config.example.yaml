@@ -177,8 +177,17 @@ grab:
   stop_on_success: true
   # 若目标课程已在已选列表里，是否先退掉再选（默认不动，直接跳过）
   drop_if_selected: false
+
+  # ---- 一键抢网课（图形界面「只抢网课（非面授）」勾选框对应的配置）----
+  # 开启后**不需要配置 targets**：点「开始」会自动查询课程 → 排除属性含「面授」的课
+  # → 对剩下的线上课依次提交。停止条件是 max_courses，此时 stop_on_success 不生效。
+  online_only: false
+  # online_only 模式下最多抢几门（默认 2：本校通识选修课每人限选两门）
+  max_courses: 2
+
   # 抢课目标，按 priority 从小到大尝试。
   # 每个目标至少给 course_name / course_code / teaching_class_id 之一，否则会被配置校验拒绝。
+  # 注意：online_only 为 true 时本列表会被忽略（改用自动查询的结果）。
   targets:
     # 示例一：只按课程名 + 教师抢（最常用）
     - course_name: "大学体育Ⅲ"

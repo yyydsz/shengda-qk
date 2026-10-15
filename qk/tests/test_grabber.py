@@ -6,13 +6,14 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
 from qk.config import CourseTarget, GrabConfig
 from qk.grabber import Grabber, find_matches, matches_target, parse_start_time
 from qk.mockserver import MockConfig
-from qk.models import CandidateCourse
+from qk.models import CandidateCourse, Outcome, SelectionResult
 
 from .conftest import MOCK_PATHS, make_course
 
@@ -589,3 +590,181 @@ def test_grab_proceeds_when_exclusion_does_not_match(mock_app):
 
     assert calls, "不命中的排除词不应阻止抢课"
     assert report.targets[0].status in ("SUCCESS", "FULL", "ALREADY_SELECTED")
+
+
+# ==========================================================================
+# 「只抢网课（非面授）」一键模式
+#
+# 用户需求：点「开始抢课」后自动查询 → 自动排除面授课 → 自动提交，
+# 不需要先手动点查询、再往③里加目标。
+#
+# 关键约定：
+#   * 只排除**属性含「面授」**的课；
+#   * 已经「选中」的课要跳过（重复提交既无意义又会触发写操作频率限制）；
+#   * 属性取不到的课**不排除** —— 宁可多试一门，也别漏掉线上课；
+#   * 停止条件是 max_courses，不是 stop_on_success。
+# ==========================================================================
+
+
+def _online_course(code: str, name: str, attr: str, *,
+                   status: str = "") -> CandidateCourse:
+    """构造一门带「课程属性」的候选课（属性决定是不是面授课）。"""
+    return CandidateCourse(
+        teaching_class_id=f"{code}-001",
+        course_code=code,
+        course_name=name,
+        credits=1.0,
+        raw={"course_attr": attr, "select_status": status},
+    )
+
+
+class _StubCourseAdapter:
+    """只实现 fetch_candidates / select 的最小桩，用于精确验证筛选与编排。"""
+
+    def __init__(self, courses: list[CandidateCourse]) -> None:
+        self.courses = courses
+        self.selected: list[str] = []
+        self.fetch_calls = 0
+
+    def fetch_candidates(self, keyword: str = ""):
+        self.fetch_calls += 1
+        return list(self.courses)
+
+    def select(self, course, *, dry_run: bool = False):
+        self.selected.append(course.course_code)
+        return SelectionResult(Outcome.SUCCESS, course, message=f"{course.course_code} 成功")
+
+    def drop(self, course, *, dry_run: bool = False):
+        return SelectionResult(Outcome.SUCCESS, course, message="drop")
+
+    def fetch_selected(self):
+        return []
+
+
+class _StubLogin:
+    """只需 ``login()`` 返回带 ok/message 的结果（Grabber.ensure_login 的契约）。"""
+
+    def login(self, *, dry_run: bool = False, force: bool = False):
+        return SimpleNamespace(ok=True, message="ok")
+
+
+def _online_grabber(config, adapter, messages: list[str]) -> Grabber:
+    return Grabber(
+        config, login_adapter=_StubLogin(), course_adapter=adapter,
+        logger=messages.append, sleep=lambda _s: None,
+    )
+
+
+def test_online_only_excludes_in_person_courses(config_factory):
+    """只抢网课：属性含「面授」的课必须被排除，线上课保留。"""
+    config = _config_with_targets(config_factory("http://127.0.0.1:1"))
+    config.grab = GrabConfig(online_only=True, max_courses=5)
+    courses = [
+        _online_course("A1", "通识面授课甲", "经济管理类/通识面授课"),
+        _online_course("A2", "网络课乙", "经济管理类/通识网络课"),
+        _online_course("A3", "慕课丙", "人文科学类/慕课"),
+        _online_course("A4", "面授丁", "艺术类/面授"),
+        _online_course("A5", "属性缺失戊", ""),
+    ]
+    adapter = _StubCourseAdapter(courses)
+    messages: list[str] = []
+    picked = _online_grabber(config, adapter, messages).discover_online_courses()
+
+    codes = [c.course_code for c in picked]
+    assert codes == ["A2", "A3", "A5"], f"面授课没被滤干净：{codes}"
+    assert any("已排除面授课 2 门" in m for m in messages), messages
+
+
+def test_online_only_skips_already_selected(config_factory):
+    """已经「选中」的课要跳过 —— 重复提交既无意义又会触发写操作频率限制。"""
+    config = _config_with_targets(config_factory("http://127.0.0.1:1"))
+    config.grab = GrabConfig(online_only=True, max_courses=5)
+    courses = [
+        _online_course("B1", "已选网课", "通识网络课", status="选中"),
+        _online_course("B2", "未选网课", "通识网络课"),
+    ]
+    adapter = _StubCourseAdapter(courses)
+    messages: list[str] = []
+    picked = _online_grabber(config, adapter, messages).discover_online_courses()
+
+    assert [c.course_code for c in picked] == ["B2"]
+    assert any("已跳过已选中的课 1 门" in m for m in messages), messages
+
+
+def test_online_only_respects_limit(config_factory):
+    """limit / max_courses 限制返回条数（通识选修课每人限选两门，抢多了也会被拒）。"""
+    config = _config_with_targets(config_factory("http://127.0.0.1:1"))
+    config.grab = GrabConfig(online_only=True, max_courses=2)
+    courses = [_online_course(f"C{i}", f"网课{i}", "通识网络课") for i in range(5)]
+    adapter = _StubCourseAdapter(courses)
+    picked = _online_grabber(config, adapter, []).discover_online_courses(limit=2)
+    assert len(picked) == 2
+
+
+def test_online_only_run_works_without_targets(config_factory):
+    """核心需求：**没有配置任何目标**也能一键抢课（自动查询 → 筛选 → 提交）。"""
+    config = _config_with_targets(config_factory("http://127.0.0.1:1"))
+    assert config.grab.targets == []
+    config.grab = GrabConfig(online_only=True, max_courses=2, retry_interval=0.0,
+                             max_attempts=1, stop_on_success=True)
+    courses = [
+        _online_course("D1", "面授课", "通识面授课"),
+        _online_course("D2", "网课一", "通识网络课"),
+        _online_course("D3", "网课二", "通识网络课"),
+    ]
+    adapter = _StubCourseAdapter(courses)
+    messages: list[str] = []
+    report = _online_grabber(config, adapter, messages).run()
+
+    assert adapter.fetch_calls >= 1, "应当自动查询过课程"
+    assert adapter.selected == ["D2", "D3"], f"应只抢网课且抢到上限：{adapter.selected}"
+    assert report.success is True
+    assert "D1" not in adapter.selected, "面授课不该被提交"
+    assert any("只抢网课" in m for m in messages), messages
+
+
+def test_online_only_stops_at_max_courses_not_first_success(config_factory):
+    """``stop_on_success`` 在网课模式下被忽略：停止条件是 max_courses。
+
+    否则「最多抢 2 门」永远只会抢 1 门 —— 两个语义是冲突的。
+    """
+    config = _config_with_targets(config_factory("http://127.0.0.1:1"))
+    config.grab = GrabConfig(online_only=True, max_courses=3, retry_interval=0.0,
+                             max_attempts=1, stop_on_success=True)
+    courses = [_online_course(f"F{i}", f"网课{i}", "通识网络课") for i in range(5)]
+    adapter = _StubCourseAdapter(courses)
+    _online_grabber(config, adapter, []).run()
+    assert adapter.selected == ["F0", "F1", "F2"], f"应抢满 3 门：{adapter.selected}"
+
+
+def test_run_still_requires_targets_when_online_only_disabled(config_factory):
+    """没开 online_only 且没有目标时，仍然报 NO_TARGET（不改变原有行为）。"""
+    config = _config_with_targets(config_factory("http://127.0.0.1:1"))
+    config.grab = GrabConfig(online_only=False)
+    adapter = _StubCourseAdapter([])
+    report = _online_grabber(config, adapter, []).run()
+    assert report.targets[0].status == "NO_TARGET"
+    assert adapter.fetch_calls == 0, "未开启时不应自动查询"
+
+
+def test_online_only_reports_no_match_when_nothing_online(config_factory):
+    """全是面授课时给出可读结论，而不是静默成功。"""
+    config = _config_with_targets(config_factory("http://127.0.0.1:1"))
+    config.grab = GrabConfig(online_only=True, max_courses=2)
+    courses = [_online_course("E1", "只有面授", "通识面授课")]
+    adapter = _StubCourseAdapter(courses)
+    report = _online_grabber(config, adapter, []).run()
+    assert report.success is False
+    assert report.targets[0].status == "NO_MATCH"
+    assert "网课" in report.targets[0].message
+
+
+def test_max_courses_validation_rejects_zero(workspace):
+    """max_courses 至少为 1（配错了要给出明确错误，而不是静默不抢）。"""
+    from qk.config import AppConfig, ConfigError
+
+    config = AppConfig()
+    config.grab = GrabConfig(online_only=True, max_courses=0)
+    with pytest.raises(ConfigError) as excinfo:
+        config.validate()
+    assert "max_courses" in str(excinfo.value)
